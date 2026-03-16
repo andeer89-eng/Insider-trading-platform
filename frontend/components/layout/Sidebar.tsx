@@ -13,6 +13,7 @@ import {
   Activity,
   Settings,
   Zap,
+  BrainCircuit,
 } from "lucide-react";
 
 const nav = [
@@ -37,6 +38,7 @@ const nav = [
       { href: "/metrics", label: "KPI Metrics", icon: Activity },
       { href: "/compare", label: "Metric Compare", icon: GitCompare },
       { href: "/industry", label: "Industry Buildout", icon: Factory },
+      { href: "/analyst", label: "AI Analyst", icon: BrainCircuit },
     ],
   },
   {

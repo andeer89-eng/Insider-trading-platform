@@ -16,6 +16,7 @@ from api.routers import (
     composite,
     pipelines,
     dashboard,
+    analyst,
 )
 
 app = FastAPI(
@@ -49,6 +50,7 @@ app.include_router(metrics.router, prefix="/api/metrics", tags=["Metrics"])
 app.include_router(institutional.router, prefix="/api/institutional", tags=["Institutional"])
 app.include_router(composite.router, prefix="/api/composite", tags=["Composite Scores"])
 app.include_router(pipelines.router, prefix="/api/pipelines", tags=["Pipelines"])
+app.include_router(analyst.router, prefix="/api/analyst", tags=["AI Analyst"])
 
 
 @app.get("/api/health")

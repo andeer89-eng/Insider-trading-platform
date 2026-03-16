@@ -227,6 +227,31 @@ export const getNetAccumulation = (sector?: string) => {
   return fetchApi<unknown[]>(`/api/institutional/net-accumulation${q}`);
 };
 
+// ---- AI Analyst ----
+export interface AnalystColumnMeta {
+  name: string;
+  type: string;
+}
+
+export interface AnalystResult {
+  question: string;
+  sql: string;
+  columns: AnalystColumnMeta[];
+  rows: Record<string, unknown>[];
+  row_count: number;
+  explanation: string;
+  truncated: boolean;
+}
+
+export const analystQuery = (question: string) =>
+  fetchApi<AnalystResult>("/api/analyst/query", {
+    method: "POST",
+    body: JSON.stringify({ question }),
+  });
+
+export const getAnalystExamples = () =>
+  fetchApi<{ examples: string[] }>("/api/analyst/examples");
+
 // ---- Composite ----
 export const getLeaderboard = (sector?: string, sortBy?: string) => {
   const q = new URLSearchParams();
