@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from models.database import SessionLocal
+from lib.cache import invalidate_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +270,7 @@ def compute_composite_score(company_id: int, score_date: date, db: Session) -> d
 
     # --- Business Momentum Score (0-10): YoY metric growth ---
     momentum_q = text("""
-        SELECT AVG(ABS(COALESCE(yoy_growth, 0))) AS avg_growth
+        SELECT AVG(COALESCE(yoy_growth, 0)) AS avg_growth
         FROM company_metric_values cmv
         JOIN metrics m ON m.id = cmv.metric_id
         WHERE cmv.company_id = :company_id
@@ -283,19 +284,23 @@ def compute_composite_score(company_id: int, score_date: date, db: Session) -> d
     }).mappings().first()
 
     avg_growth = float(mom["avg_growth"] or 0)
-    # 20%+ YoY growth → score of 10
-    business_momentum_score = round(min(10.0, avg_growth / 20.0 * 10), 2)
+    # Maps: -20% → 0, 0% → 5, +20% → 10 (linear, clamped)
+    business_momentum_score = round(min(10.0, max(0.0, 5.0 + avg_growth / 20.0 * 5)), 2)
 
     # --- Industry Score (0-10): Sector-wide momentum ---
     industry_q = text("""
-        SELECT COALESCE(AVG(composite_score), 5) AS sector_avg
-        FROM company_composite_scores ccs
-        JOIN companies c ON c.id = ccs.company_id
-        WHERE c.id = (SELECT sector FROM companies WHERE id = :company_id LIMIT 1)
-          AND ccs.date >= :lookback
+        SELECT COALESCE(AVG(ccs2.composite_score), 5) AS sector_avg
+        FROM company_composite_scores ccs2
+        JOIN companies c2 ON c2.id = ccs2.company_id
+        WHERE c2.sector = (SELECT sector FROM companies WHERE id = :company_id)
+          AND c2.id != :company_id
+          AND ccs2.date >= :industry_lookback
     """)
-    # Simplified: use fixed 5.0 if no cross-sector data yet
-    industry_score = 5.0
+    ind = db.execute(industry_q, {
+        "company_id": company_id,
+        "industry_lookback": score_date - timedelta(days=90),
+    }).mappings().first()
+    industry_score = round(float(ind["sector_avg"]) if ind and ind["sector_avg"] else 5.0, 2)
 
     # --- Composite ---
     composite = round(
@@ -322,10 +327,70 @@ def compute_composite_score(company_id: int, score_date: date, db: Session) -> d
     }
 
 
+def _bulk_fetch_skill_scores(insider_ids: list, db: Session) -> dict:
+    """
+    Fetch historical win-rate and alpha for a batch of insiders in one query.
+    Returns {insider_id: {"n_buys": int, "n_wins": int, "avg_alpha": float}}.
+    """
+    if not insider_ids:
+        return {}
+    rows = db.execute(text("""
+        SELECT
+            it.insider_id,
+            COUNT(*) AS n_buys,
+            COUNT(CASE WHEN ito.return_30d > 0 THEN 1 END) AS n_wins,
+            AVG(ito.alpha_30d) AS avg_alpha
+        FROM insider_transactions it
+        JOIN insider_trade_outcomes ito ON ito.transaction_id = it.id
+        WHERE it.insider_id = ANY(:ids)
+          AND it.transaction_type IN ('Buy', 'Purchase')
+          AND ito.return_30d IS NOT NULL
+        GROUP BY it.insider_id
+    """), {"ids": list(insider_ids)}).mappings().all()
+    return {r["insider_id"]: r for r in rows}
+
+
+def _bulk_fetch_clusters(company_ids: list, window_days: int, db: Session) -> set:
+    """
+    Return the set of company_ids where >= CLUSTER_MIN_INSIDERS distinct insiders
+    have bought within the last `window_days` days.
+    """
+    if not company_ids:
+        return set()
+    rows = db.execute(text("""
+        SELECT company_id
+        FROM insider_transactions
+        WHERE company_id = ANY(:ids)
+          AND transaction_type IN ('Buy', 'Purchase')
+          AND transaction_date >= CURRENT_DATE - INTERVAL '14 days'
+          AND insider_id IS NOT NULL
+        GROUP BY company_id
+        HAVING COUNT(DISTINCT insider_id) >= :min_insiders
+    """), {"ids": list(company_ids), "min_insiders": CLUSTER_MIN_INSIDERS}).fetchall()
+    return {r[0] for r in rows}
+
+
+def _compute_skill_score_from_row(row) -> float:
+    """Compute skill score from a pre-fetched aggregate row (no DB call)."""
+    if not row or not row["n_buys"] or row["n_buys"] < 2:
+        return 5.0
+    n_buys = row["n_buys"]
+    n_wins = row["n_wins"] or 0
+    avg_alpha = float(row["avg_alpha"] or 0)
+    win_rate = n_wins / n_buys
+    alpha_score = min(10.0, max(0.0, 5.0 + avg_alpha * 50))
+    return round(min(10.0, max(0.0, (win_rate * 10 * 0.6) + (alpha_score * 0.4))), 2)
+
+
 def run_signal_scoring():
     """
     Main entry point: score all unscored transactions
     and recompute composite scores.
+
+    Uses bulk DB queries to avoid N+1 round-trips:
+      - insider skill scores: 1 query for all insiders
+      - cluster detection: 1 query for all companies
+      - score upserts: batched executemany
     """
     db = SessionLocal()
     logger.info("Starting signal scoring run...")
@@ -349,20 +414,73 @@ def run_signal_scoring():
         transactions = db.execute(unscored_q).mappings().all()
         logger.info(f"Scoring {len(transactions)} unscored transactions")
 
-        scored = 0
-        for tx in transactions:
-            score_data = score_transaction(
-                transaction_id=tx["id"],
-                company_id=tx["company_id"],
-                insider_id=tx["insider_id"],
-                insider_role=tx["insider_role"],
-                transaction_date=tx["transaction_date"],
-                transaction_type=tx["transaction_type"],
-                transaction_value=float(tx["transaction_value"]) if tx["transaction_value"] else None,
-                ownership_change_pct=float(tx["ownership_change_pct"]) if tx["ownership_change_pct"] else None,
-                db=db,
-            )
-            if score_data:
+        if not transactions:
+            logger.info("No unscored transactions found.")
+        else:
+            # Bulk-fetch all needed data in 2 queries instead of 2×N queries
+            insider_ids = {tx["insider_id"] for tx in transactions if tx["insider_id"]}
+            company_ids = {tx["company_id"] for tx in transactions}
+
+            skill_map = _bulk_fetch_skill_scores(insider_ids, db)
+            cluster_companies = _bulk_fetch_clusters(company_ids, CLUSTER_WINDOW_DAYS, db)
+
+            # Score in-memory
+            scored = 0
+            score_rows = []
+            for tx in transactions:
+                if tx["transaction_type"] not in ("Buy", "Purchase"):
+                    continue
+
+                role_score = get_role_score(tx["insider_role"])
+                size_score = get_size_score(
+                    float(tx["transaction_value"]) if tx["transaction_value"] else None
+                )
+                ownership_score = get_ownership_score(
+                    float(tx["ownership_change_pct"]) if tx["ownership_change_pct"] else None
+                )
+                history_score = _compute_skill_score_from_row(
+                    skill_map.get(tx["insider_id"])
+                ) if tx["insider_id"] else 5.0
+                cluster_flag = tx["company_id"] in cluster_companies
+
+                base_score = (
+                    role_score * 0.25 +
+                    size_score * 0.30 +
+                    ownership_score * 0.20 +
+                    history_score * 0.15
+                )
+                final_score = min(10.0, base_score + (1.0 if cluster_flag else 0.0))
+
+                reasons = []
+                if role_score >= 9:
+                    reasons.append(f"C-suite executive ({tx['insider_role']})")
+                if size_score >= 8:
+                    val = tx["transaction_value"]
+                    reasons.append(f"Large purchase (${float(val):,.0f})" if val else "Large purchase")
+                if ownership_score >= 7:
+                    pct = tx["ownership_change_pct"]
+                    reasons.append(f"+{float(pct):.1f}% ownership increase" if pct else "Ownership increase")
+                if cluster_flag:
+                    reasons.append("Cluster buying detected")
+                if history_score >= 7:
+                    reasons.append("High-performing insider (historical alpha)")
+
+                score_rows.append({
+                    "transaction_id": tx["id"],
+                    "score": round(final_score, 2),
+                    "size_score": round(size_score, 2),
+                    "role_score": round(role_score, 2),
+                    "history_score": round(history_score, 2),
+                    "ownership_score": round(ownership_score, 2),
+                    "cluster_flag": cluster_flag,
+                    "ownership_change_pct": float(tx["ownership_change_pct"]) if tx["ownership_change_pct"] else None,
+                    "insider_skill_score": round(history_score, 2),
+                    "signal_reason": "; ".join(reasons) if reasons else "Standard insider purchase",
+                })
+                scored += 1
+
+            # Bulk upsert all scored rows
+            if score_rows:
                 upsert_q = text("""
                     INSERT INTO insider_signal_scores
                         (transaction_id, score, size_score, role_score, history_score,
@@ -375,10 +493,10 @@ def run_signal_scoring():
                     ON CONFLICT (transaction_id) DO UPDATE SET
                         score = EXCLUDED.score,
                         cluster_flag = EXCLUDED.cluster_flag,
-                        signal_reason = EXCLUDED.signal_reason
+                        signal_reason = EXCLUDED.signal_reason,
+                        updated_at = NOW()
                 """)
-                db.execute(upsert_q, score_data)
-                scored += 1
+                db.execute(upsert_q, score_rows)
 
         db.commit()
         logger.info(f"Scored {scored} transactions")
@@ -409,6 +527,13 @@ def run_signal_scoring():
 
         db.commit()
         logger.info(f"Recomputed composite scores for {len(companies)} companies")
+
+        # Invalidate all cached leaderboard / dashboard / composite-score keys
+        # so the next API request reflects freshly computed scores immediately.
+        for prefix in ("leaderboard:", "dashboard", "composite_scores:"):
+            n_evicted = invalidate_prefix(prefix)
+            if n_evicted:
+                logger.info(f"Evicted {n_evicted} cache keys for prefix '{prefix}'")
 
         # Log pipeline run
         db.execute(text("""

@@ -182,6 +182,14 @@ def process_transcript(db, transcript_id: int, company_id: int, ticker: str,
         if value is None:
             continue
 
+        # Parse date from fiscal_quarter (e.g., "Q1 2024" → 2024-03-31).
+        # Skip this KPI entirely if the quarter string is unparseable — never
+        # use date.today() as a fallback, which would corrupt time-series data.
+        period_date = parse_fiscal_quarter_date(fiscal_quarter)
+        if period_date is None:
+            logger.warning(f"Skipping KPI {metric_name!r}: unparseable quarter {fiscal_quarter!r}")
+            continue
+
         metric_id = get_or_create_metric(
             db,
             metric_name=metric_name,
@@ -189,9 +197,6 @@ def process_transcript(db, transcript_id: int, company_id: int, ticker: str,
             category=kpi.get("category", "operational"),
             unit=kpi.get("unit", ""),
         )
-
-        # Parse date from fiscal_quarter (e.g., "Q1 2024" → 2024-03-31)
-        period_date = parse_fiscal_quarter_date(fiscal_quarter)
 
         try:
             db.execute(text("""
@@ -210,27 +215,39 @@ def process_transcript(db, transcript_id: int, company_id: int, ticker: str,
         except Exception as e:
             logger.debug(f"KPI insert error: {e}")
 
-    # Mark transcript as processed
-    db.execute(text("""
-        UPDATE earnings_transcripts SET processed = TRUE WHERE id = :id
-    """), {"id": transcript_id})
+    # Only mark as processed if at least one KPI was successfully extracted.
+    # Transcripts where the LLM returned nothing (rate limit, transient error,
+    # or genuinely empty) remain unprocessed so they are retried on the next run.
+    if count > 0:
+        db.execute(text("""
+            UPDATE earnings_transcripts SET processed = TRUE WHERE id = :id
+        """), {"id": transcript_id})
+    else:
+        logger.warning(f"Transcript {transcript_id} yielded 0 KPIs — leaving unprocessed for retry")
 
     return count
 
 
-def parse_fiscal_quarter_date(quarter_str: str) -> date:
-    """Convert 'Q1 2024' → 2024-03-31, 'Q2 2024' → 2024-06-30, etc."""
+def parse_fiscal_quarter_date(quarter_str: str) -> Optional[date]:
+    """
+    Convert 'Q1 2024' → 2024-03-31, 'Q2 2024' → 2024-06-30, etc.
+    Returns None on parse failure so callers can skip rather than corrupt data.
+    """
     try:
         parts = quarter_str.upper().split()
         q_num = int(parts[0].replace("Q", ""))
         year = int(parts[1])
+        if not (1 <= q_num <= 4) or not (1990 <= year <= 2100):
+            logger.warning(f"Unrecognised fiscal quarter string: {quarter_str!r}")
+            return None
         month_map = {1: 3, 2: 6, 3: 9, 4: 12}
-        month = month_map.get(q_num, 12)
+        month = month_map[q_num]
         from calendar import monthrange
         last_day = monthrange(year, month)[1]
         return date(year, month, last_day)
     except Exception:
-        return date.today()
+        logger.warning(f"Could not parse fiscal quarter date: {quarter_str!r}")
+        return None
 
 
 def run_kpi_pipeline():

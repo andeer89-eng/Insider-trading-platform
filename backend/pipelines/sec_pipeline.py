@@ -311,20 +311,42 @@ def ingest_filing(db, filing_meta: dict) -> int:
 
     for tx in parsed["transactions"]:
         try:
-            # Compute ownership change %
-            ownership_change_pct = None
             ownership_after = tx.get("ownership_after")
+
+            # Compute ownership change % from the insider's most recent prior holding
+            ownership_change_pct = None
+            if insider_id and ownership_after:
+                prev_row = db.execute(text("""
+                    SELECT ownership_after FROM insider_transactions
+                    WHERE insider_id = :iid
+                      AND company_id = :cid
+                      AND transaction_date < :tx_date
+                      AND ownership_after IS NOT NULL
+                    ORDER BY transaction_date DESC, id DESC
+                    LIMIT 1
+                """), {
+                    "iid": insider_id,
+                    "cid": company_id,
+                    "tx_date": tx["transaction_date"],
+                }).fetchone()
+                if prev_row and prev_row[0] and float(prev_row[0]) > 0:
+                    prev_shares = float(prev_row[0])
+                    after_shares = float(ownership_after)
+                    ownership_change_pct = round(
+                        (after_shares - prev_shares) / prev_shares * 100, 4
+                    )
 
             db.execute(text("""
                 INSERT INTO insider_transactions
                     (insider_id, company_id, transaction_date, filing_date, transaction_type,
-                     shares, price, transaction_value, ownership_after,
+                     shares, price, transaction_value, ownership_after, ownership_change_pct,
                      is_direct, security_title, filing_type, accession_number)
                 VALUES
                     (:insider_id, :company_id, :transaction_date, :filing_date, :transaction_type,
-                     :shares, :price, :transaction_value, :ownership_after,
+                     :shares, :price, :transaction_value, :ownership_after, :ownership_change_pct,
                      :is_direct, :security_title, :filing_type, :accession_number)
-                ON CONFLICT DO NOTHING
+                ON CONFLICT (company_id, accession_number, transaction_date, transaction_type, shares)
+                    DO NOTHING
             """), {
                 "insider_id": insider_id,
                 "company_id": company_id,
@@ -335,6 +357,7 @@ def ingest_filing(db, filing_meta: dict) -> int:
                 "price": tx["price"],
                 "transaction_value": tx["transaction_value"],
                 "ownership_after": ownership_after,
+                "ownership_change_pct": ownership_change_pct,
                 "is_direct": tx.get("is_direct", True),
                 "security_title": tx.get("security_title"),
                 "filing_type": filing_meta["form_type"],

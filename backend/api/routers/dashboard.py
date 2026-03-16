@@ -9,6 +9,7 @@ from typing import List, Optional
 
 from models.database import get_db
 from models.schemas import HomepageData, TopInsiderSignal, CompositeScore, ClusterEvent
+from lib.cache import get_cache, set_cache
 
 router = APIRouter()
 
@@ -16,6 +17,11 @@ router = APIRouter()
 @router.get("/dashboard", response_model=HomepageData)
 def get_dashboard(db: Session = Depends(get_db)):
     """Homepage dashboard with top signals, scores, and cluster events."""
+    cache_key = "dashboard"
+    cached = get_cache(cache_key)
+    if cached is not None:
+        return HomepageData(**cached)
+
     today = date.today()
     lookback = today - timedelta(days=30)
 
@@ -49,26 +55,29 @@ def get_dashboard(db: Session = Depends(get_db)):
     """)
     signals_rows = db.execute(signals_q, {"lookback": lookback}).mappings().all()
 
-    # Top composite scores
+    # Top composite scores — dedup in subquery, sort + limit in DB
     composite_q = text("""
-        SELECT DISTINCT ON (ccs.company_id)
-            ccs.company_id,
-            c.ticker,
-            c.name AS company_name,
-            c.sector,
-            ccs.date,
-            ccs.insider_score,
-            ccs.institutional_score,
-            ccs.business_momentum_score,
-            ccs.industry_score,
-            ccs.composite_score,
-            ccs.insider_alignment
-        FROM company_composite_scores ccs
-        JOIN companies c ON c.id = ccs.company_id
-        ORDER BY ccs.company_id, ccs.date DESC
+        SELECT * FROM (
+            SELECT DISTINCT ON (ccs.company_id)
+                ccs.company_id,
+                c.ticker,
+                c.name AS company_name,
+                c.sector,
+                ccs.date,
+                ccs.insider_score,
+                ccs.institutional_score,
+                ccs.business_momentum_score,
+                ccs.industry_score,
+                ccs.composite_score,
+                ccs.insider_alignment
+            FROM company_composite_scores ccs
+            JOIN companies c ON c.id = ccs.company_id
+            ORDER BY ccs.company_id, ccs.date DESC
+        ) latest
+        ORDER BY composite_score DESC NULLS LAST
+        LIMIT 10
     """)
-    composite_rows = db.execute(composite_q).mappings().all()
-    composite_sorted = sorted(composite_rows, key=lambda x: x["composite_score"] or 0, reverse=True)[:10]
+    composite_sorted = db.execute(composite_q).mappings().all()
 
     # Recent cluster events
     cluster_q = text("""
@@ -102,7 +111,7 @@ def get_dashboard(db: Session = Depends(get_db)):
     """)
     stats = db.execute(stats_q, {"today": today}).mappings().first()
 
-    return HomepageData(
+    payload = HomepageData(
         top_signals=[TopInsiderSignal(**dict(r)) for r in signals_rows],
         top_composite_scores=[CompositeScore(**dict(r)) for r in composite_sorted],
         recent_cluster_events=[ClusterEvent(**dict(r)) for r in cluster_rows],
@@ -110,6 +119,8 @@ def get_dashboard(db: Session = Depends(get_db)):
         total_buy_value_today=float(stats["buy_value"] or 0) if stats else 0.0,
         market_date=today,
     )
+    set_cache(cache_key, payload.model_dump(), ttl=60)
+    return payload
 
 
 @router.get("/dashboard/signals/top", response_model=List[TopInsiderSignal])

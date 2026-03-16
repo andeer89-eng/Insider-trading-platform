@@ -1,0 +1,110 @@
+version: '3.9'
+
+# ============================================================
+# PRODUCTION COMPOSE
+# Required environment variables (set in .env or shell):
+#   POSTGRES_PASSWORD     — strong DB password
+#   OPENAI_API_KEY        — OpenAI API key
+#   NEXT_PUBLIC_API_URL   — public URL of the backend, e.g. https://api.yourdomain.com
+#   ALLOWED_ORIGINS       — CORS origin of the frontend, e.g. https://yourdomain.com
+#   API_KEYS              — comma-separated keys for protected endpoints
+# ============================================================
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: fintel_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: fintel
+      POSTGRES_USER: fintel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fintel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # No port exposure in production — only accessible within the Docker network
+
+  redis:
+    image: redis:7-alpine
+    container_name: fintel_redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    # No port exposure in production
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    container_name: fintel_backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://fintel:${POSTGRES_PASSWORD}@db:5432/fintel
+      REDIS_URL: redis://redis:6379
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY is required}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required}
+      API_KEYS: ${API_KEYS:-}
+      ENVIRONMENT: production
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # No source code volume mount in production
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Build arg so NEXT_PUBLIC_API_URL is baked into the bundle at build time
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL is required}
+    container_name: fintel_frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    # No source code volume mount in production
+
+  scheduler:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.prod
+    container_name: fintel_scheduler
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://fintel:${POSTGRES_PASSWORD}@db:5432/fintel
+      REDIS_URL: redis://redis:6379
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ENVIRONMENT: production
+    depends_on:
+      db:
+        condition: service_healthy
+    command: python -m pipelines.scheduler
+
+volumes:
+  postgres_data:
+  redis_data:

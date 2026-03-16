@@ -1,5 +1,10 @@
 version: '3.9'
 
+# ============================================================
+# DEVELOPMENT COMPOSE — hot-reload, live source mounts
+# For production use: docker-compose -f docker-compose.prod.yml up
+# ============================================================
+
 services:
   db:
     image: postgres:16-alpine
@@ -26,6 +31,11 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   backend:
     build:
@@ -37,17 +47,25 @@ services:
       REDIS_URL: redis://redis:6379
       SEC_EDGAR_BASE_URL: https://data.sec.gov
       ENVIRONMENT: development
+      ALLOWED_ORIGINS: "http://localhost:3000"
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./backend:/app
       - ./data_lake:/data_lake
+    # --reload is intentional here for development hot-reload
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   frontend:
     build:
@@ -55,11 +73,15 @@ services:
       dockerfile: Dockerfile
     container_name: fintel_frontend
     environment:
+      # NEXT_PUBLIC_API_URL is embedded in the browser bundle at build time.
+      # In dev, the user's browser reaches the backend at localhost:8000.
+      # For remote/production deployments set this to the public backend URL.
       NEXT_PUBLIC_API_URL: http://localhost:8000
     ports:
       - "3000:3000"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     volumes:
       - ./frontend:/app
       - /app/node_modules
@@ -74,6 +96,7 @@ services:
       DATABASE_URL: postgresql://fintel:fintel_secret@db:5432/fintel
       REDIS_URL: redis://redis:6379
       SEC_EDGAR_BASE_URL: https://data.sec.gov
+      ENVIRONMENT: development
     depends_on:
       db:
         condition: service_healthy
